@@ -76,6 +76,47 @@ public static class IdleUtil
         return (int)(idleMs / 1000);
     }
 }
+
+public static class InputUtil
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT
+    {
+        public uint type;
+        public MOUSEINPUT mi;
+    }
+
+    [DllImport("user32.dll")]
+    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    // SetCursorPos does NOT reliably reset Windows' real input-idle timer when
+    // called from within an active WinForms message loop (verified empirically:
+    // it works fine from plain sequential script code, but silently fails to
+    // register as real input once a Timer.Tick handler is driving it under
+    // Application.Run() -- which is exactly this app's context). SendInput is
+    // the API actually meant for synthesizing recognized input and reliably
+    // resets the idle timer in both contexts.
+    public static void MoveRelative(int dx, int dy)
+    {
+        INPUT[] inputs = new INPUT[1];
+        inputs[0].type = 0; // INPUT_MOUSE
+        inputs[0].mi.dx = dx;
+        inputs[0].mi.dy = dy;
+        inputs[0].mi.dwFlags = 0x0001; // MOUSEEVENTF_MOVE (relative)
+        SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
 "@
 
 try {
@@ -806,9 +847,9 @@ $timer.Add_Tick({
             $screenBounds = [System.Windows.Forms.Screen]::FromPoint($pos).Bounds
             $dx = $script:NudgeDistancePx
             if ($pos.X + $dx -gt ($screenBounds.Right - 1)) { $dx = -$dx }
-            [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point ($pos.X + $dx), $pos.Y
+            [InputUtil]::MoveRelative($dx, 0)
             Start-Sleep -Milliseconds 50
-            [System.Windows.Forms.Cursor]::Position = $pos
+            [InputUtil]::MoveRelative(-$dx, 0)
             Write-Log "nudge (${script:CurrentDistanceMm}mm / $($script:NudgeDistancePx)px, idle ${idleSec}s)"
         } else {
             Write-Log "tick skipped (user active, idle ${idleSec}s < $($script:IdleThresholdSeconds)s)"
