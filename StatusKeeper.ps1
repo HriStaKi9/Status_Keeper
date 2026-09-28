@@ -390,8 +390,11 @@ foreach ($label in $intervalPresets.Keys) {
 }
 
 $currentIntervalSeconds = Get-SavedIntervalSeconds
+$script:IdleThresholdSeconds = $currentIntervalSeconds
+$PollIntervalMs = 5000   # fixed, frequent poll rate so a nudge is never more than ~5s late,
+                         # regardless of how long the configured idle threshold is
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = $currentIntervalSeconds * 1000
+$timer.Interval = $PollIntervalMs
 Write-Log "interval set to ${currentIntervalSeconds}s at startup"
 
 $script:PixelsPerMm = Get-PixelsPerMm
@@ -702,7 +705,7 @@ function Sync-IntervalUI([int]$sec) {
 }
 
 function Set-Interval([int]$sec) {
-    $timer.Interval = $sec * 1000
+    $script:IdleThresholdSeconds = $sec
     Save-IntervalSeconds $sec
     Sync-IntervalUI $sec
     Write-Log "interval changed to ${sec}s"
@@ -719,7 +722,7 @@ function Set-Distance([double]$mm) {
 
 function Show-SettingsWindow {
     Update-PauseUI
-    Sync-IntervalUI ([int]($timer.Interval / 1000))
+    Sync-IntervalUI $script:IdleThresholdSeconds
     $distanceNumeric.Value = [Math]::Min($MaxDistanceMm, [Math]::Max($MinDistanceMm, [int]$script:CurrentDistanceMm))
     Update-DistanceReadout
     $lidLockCheckbox.Checked = $script:LidLockEnabled
@@ -793,8 +796,7 @@ Update-PauseUI
 $timer.Add_Tick({
     if (-not $script:Paused) {
         $idleSec = [IdleUtil]::GetIdleSeconds()
-        $intervalSec = [int]($timer.Interval / 1000)
-        if ($idleSec -ge $intervalSec) {
+        if ($idleSec -ge $script:IdleThresholdSeconds) {
             $pos = [System.Windows.Forms.Cursor]::Position
             $screenBounds = [System.Windows.Forms.Screen]::FromPoint($pos).Bounds
             $dx = $script:NudgeDistancePx
@@ -804,7 +806,7 @@ $timer.Add_Tick({
             [System.Windows.Forms.Cursor]::Position = $pos
             Write-Log "nudge (${script:CurrentDistanceMm}mm / $($script:NudgeDistancePx)px, idle ${idleSec}s)"
         } else {
-            Write-Log "tick skipped (user active, idle ${idleSec}s < ${intervalSec}s)"
+            Write-Log "tick skipped (user active, idle ${idleSec}s < $($script:IdleThresholdSeconds)s)"
         }
     } else {
         Write-Log "tick skipped (paused)"
