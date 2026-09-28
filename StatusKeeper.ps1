@@ -736,7 +736,12 @@ function Invoke-Quit {
     Write-Log "quit"
     $timer.Stop()
     $notifyIcon.Visible = $false
+    $notifyIcon.Dispose()
     [System.Windows.Forms.Application]::Exit()
+    # SystemEvents subscriptions (e.g. PowerModeChanged) keep a background
+    # thread alive even after Application.Exit(), which would otherwise leave
+    # a lingering zombie process with no visible tray icon. Force a real exit.
+    [System.Environment]::Exit(0)
 }
 
 function Invoke-Uninstall {
