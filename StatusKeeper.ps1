@@ -17,17 +17,25 @@ public static extern bool LockWorkStation();
 
 Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Windows.Forms;
 using System.Runtime.InteropServices;
 
 public class LidAwareForm : Form
 {
     public static readonly Guid GUID_LIDSWITCH_STATE_CHANGE = new Guid("BA3E0F4D-B817-4094-A2D1-D56379E6A0F3");
+    // Fires whenever the built-in panel's brightness changes -- including via the
+    // laptop's own Fn brightness keys, which are handled by firmware and never
+    // arrive as ordinary key presses an app could hook.
+    public static readonly Guid GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS = new Guid("8FFEE2C6-2D01-46BE-ADB9-398ADDC5B4FF");
     private const int WM_POWERBROADCAST = 0x0218;
     private const int PBT_POWERSETTINGCHANGE = 0x8013;
 
     public bool LidIsOpen = true;
     public event EventHandler LidStateChanged;
+
+    public int CurrentBrightness = -1;
+    public event EventHandler BrightnessChanged;
 
     [DllImport("user32.dll")]
     static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid PowerSettingGuid, int Flags);
@@ -37,6 +45,8 @@ public class LidAwareForm : Form
         base.OnHandleCreated(e);
         Guid g = GUID_LIDSWITCH_STATE_CHANGE;
         RegisterPowerSettingNotification(this.Handle, ref g, 0);
+        Guid b = GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS;
+        RegisterPowerSettingNotification(this.Handle, ref b, 0);
     }
 
     protected override void WndProc(ref Message m)
@@ -50,8 +60,123 @@ public class LidAwareForm : Form
                 LidIsOpen = (value != 0);
                 if (LidStateChanged != null) LidStateChanged(this, EventArgs.Empty);
             }
+            else if (settingGuid == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS)
+            {
+                CurrentBrightness = Marshal.ReadInt32(m.LParam, 20);
+                if (BrightnessChanged != null) BrightnessChanged(this, EventArgs.Empty);
+            }
         }
         base.WndProc(ref m);
+    }
+}
+
+public class DdcMonitor
+{
+    public IntPtr HMonitor;
+    public int Index;
+    public string Name;
+    public bool HasBrightness;
+    public int Brightness;
+    public int BrightnessMax;
+    public bool HasVolume;
+    public int Volume;
+    public int VolumeMax;
+}
+
+// External monitors are controlled over DDC/CI (the monitor's own control
+// channel over the video cable), exposed by Windows through dxva2.dll. Physical
+// monitor handles are opened per call rather than cached, since monitors can be
+// unplugged or re-enumerated at any time (docking, sleep, resolution changes).
+public static class MonitorUtil
+{
+    public const byte VCP_BRIGHTNESS = 0x10;
+    public const byte VCP_VOLUME = 0x62;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct PHYSICAL_MONITOR
+    {
+        public IntPtr hPhysicalMonitor;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string szPhysicalMonitorDescription;
+    }
+
+    delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, IntPtr lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+    [DllImport("dxva2.dll")]
+    static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint count);
+    [DllImport("dxva2.dll")]
+    static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, uint count, [Out] PHYSICAL_MONITOR[] monitors);
+    [DllImport("dxva2.dll")]
+    static extern bool DestroyPhysicalMonitors(uint count, PHYSICAL_MONITOR[] monitors);
+    [DllImport("dxva2.dll")]
+    static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr hMonitor, byte code, IntPtr type, out uint current, out uint maximum);
+    [DllImport("dxva2.dll")]
+    static extern bool SetVCPFeature(IntPtr hMonitor, byte code, uint value);
+
+    static List<IntPtr> GetHMonitors()
+    {
+        List<IntPtr> list = new List<IntPtr>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (h, dc, r, d) => { list.Add(h); return true; }, IntPtr.Zero);
+        return list;
+    }
+
+    // Only monitors that actually answer DDC/CI for brightness or volume are
+    // returned; e.g. a laptop's built-in panel doesn't speak DDC/CI at all.
+    public static List<DdcMonitor> GetMonitors()
+    {
+        List<DdcMonitor> result = new List<DdcMonitor>();
+        foreach (IntPtr hMon in GetHMonitors())
+        {
+            uint count;
+            if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, out count) || count == 0) continue;
+            PHYSICAL_MONITOR[] pms = new PHYSICAL_MONITOR[count];
+            if (!GetPhysicalMonitorsFromHMONITOR(hMon, count, pms)) continue;
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    DdcMonitor m = new DdcMonitor();
+                    m.HMonitor = hMon;
+                    m.Index = i;
+                    m.Name = pms[i].szPhysicalMonitorDescription;
+                    uint cur, max;
+                    if (GetVCPFeatureAndVCPFeatureReply(pms[i].hPhysicalMonitor, VCP_BRIGHTNESS, IntPtr.Zero, out cur, out max) && max > 0)
+                    {
+                        m.HasBrightness = true; m.Brightness = (int)cur; m.BrightnessMax = (int)max;
+                    }
+                    if (GetVCPFeatureAndVCPFeatureReply(pms[i].hPhysicalMonitor, VCP_VOLUME, IntPtr.Zero, out cur, out max) && max > 0)
+                    {
+                        m.HasVolume = true; m.Volume = (int)cur; m.VolumeMax = (int)max;
+                    }
+                    if (m.HasBrightness || m.HasVolume) result.Add(m);
+                }
+            }
+            finally
+            {
+                DestroyPhysicalMonitors(count, pms);
+            }
+        }
+        return result;
+    }
+
+    public static bool SetFeature(IntPtr hMonitor, int index, byte code, int value)
+    {
+        // Guard against a stale HMONITOR from before a display change
+        if (!GetHMonitors().Contains(hMonitor)) return false;
+        uint count;
+        if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor, out count) || index >= count) return false;
+        PHYSICAL_MONITOR[] pms = new PHYSICAL_MONITOR[count];
+        if (!GetPhysicalMonitorsFromHMONITOR(hMonitor, count, pms)) return false;
+        try
+        {
+            return SetVCPFeature(pms[index].hPhysicalMonitor, code, (uint)Math.Max(0, value));
+        }
+        finally
+        {
+            DestroyPhysicalMonitors(count, pms);
+        }
     }
 }
 
@@ -141,7 +266,8 @@ $LogPath = Join-Path $InstallDir "status-keeper.log"
 $ConfigPath = Join-Path $InstallDir "interval.txt"
 $DistanceConfigPath = Join-Path $InstallDir "distance.txt"
 $LidLockConfigPath = Join-Path $InstallDir "lidlock.txt"
-$AppVersion = "1.1.0.0"
+$LinkBrightnessConfigPath = Join-Path $InstallDir "linkbrightness.txt"
+$AppVersion = "1.2.0.0"
 $MinIntervalSeconds = 20
 $DefaultIntervalSeconds = 60
 $MinDistanceMm = 1
@@ -273,6 +399,121 @@ function Get-SavedLidLockEnabled {
 
 function Save-LidLockEnabled([bool]$enabled) {
     $(if ($enabled) { "1" } else { "0" }) | Out-File -FilePath $LidLockConfigPath -Encoding utf8 -NoNewline
+}
+
+function Get-SavedLinkBrightnessEnabled {
+    if (Test-Path $LinkBrightnessConfigPath) {
+        return ((Get-Content $LinkBrightnessConfigPath -Raw -ErrorAction SilentlyContinue).Trim() -eq "1")
+    }
+    return $false
+}
+
+function Save-LinkBrightnessEnabled([bool]$enabled) {
+    $(if ($enabled) { "1" } else { "0" }) | Out-File -FilePath $LinkBrightnessConfigPath -Encoding utf8 -NoNewline
+}
+
+# ---- Display brightness / volume ----
+# $script:Displays caches every adjustable display. Brightness/Volume on each
+# entry hold the *desired* value, updated immediately on slider moves or
+# brightness-key presses; the actual (slow, ~50ms) DDC/CI writes are queued and
+# flushed by a short debounce timer so dragging a slider doesn't flood the monitor.
+$script:Displays = $null
+$script:PendingDisplayWrites = [ordered]@{}
+$script:LastInternalBrightness = -1
+
+function Update-DisplayList {
+    $list = New-Object System.Collections.ArrayList
+    try {
+        foreach ($b in @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object { $_.Active })) {
+            [void]$list.Add([pscustomobject]@{
+                Kind = 'wmi'; Name = 'Built-in display'; InstanceName = $b.InstanceName
+                HMonitor = [IntPtr]::Zero; Index = 0
+                HasBrightness = $true; Brightness = [int]$b.CurrentBrightness; BrightnessMax = 100
+                HasVolume = $false; Volume = 0; VolumeMax = 0
+                BrightnessBar = $null; VolumeBar = $null
+            })
+        }
+    } catch {}
+    try {
+        foreach ($m in [MonitorUtil]::GetMonitors()) {
+            [void]$list.Add([pscustomobject]@{
+                Kind = 'ddc'; Name = $m.Name; InstanceName = $null
+                HMonitor = $m.HMonitor; Index = $m.Index
+                HasBrightness = $m.HasBrightness; Brightness = $m.Brightness; BrightnessMax = $m.BrightnessMax
+                HasVolume = $m.HasVolume; Volume = $m.Volume; VolumeMax = $m.VolumeMax
+                BrightnessBar = $null; VolumeBar = $null
+            })
+        }
+    } catch {
+        Write-Log "external monitor detection failed: $($_.Exception.Message)"
+    }
+    $script:Displays = $list
+    $script:DisplaysReadAt = Get-Date
+    $script:PendingDisplayWrites.Clear()
+}
+
+# Re-reads the external monitors' actual values into the existing entries (so
+# slider references stay valid). Needed because the monitor may have been changed
+# from its own buttons since we last looked; a brightness-key step applied to a
+# stale cached value would make the monitor jump.
+function Update-DisplayValues {
+    if ($null -eq $script:Displays) { Update-DisplayList; return }
+    try {
+        $fresh = [MonitorUtil]::GetMonitors()
+        foreach ($d in @($script:Displays | Where-Object { $_.Kind -eq 'ddc' })) {
+            $f = $fresh | Where-Object { $_.HMonitor -eq $d.HMonitor -and $_.Index -eq $d.Index } | Select-Object -First 1
+            if (-not $f) { Update-DisplayList; return }
+            $d.Brightness = $f.Brightness
+            $d.Volume = $f.Volume
+        }
+        $script:DisplaysReadAt = Get-Date
+    } catch {
+        Update-DisplayList
+    }
+}
+
+function Write-DisplayFeature($display, [string]$feature) {
+    $value = if ($feature -eq 'volume') { $display.Volume } else { $display.Brightness }
+    $ok = $false
+    try {
+        if ($display.Kind -eq 'wmi') {
+            $m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop |
+                Where-Object { $_.InstanceName -eq $display.InstanceName } | Select-Object -First 1
+            if ($m) {
+                # Record it first, so the brightness notification this triggers isn't
+                # mistaken for a brightness-key press and mirrored to external monitors
+                $script:LastInternalBrightness = $value
+                Invoke-CimMethod -InputObject $m -MethodName WmiSetBrightness -Arguments @{ Timeout = [uint32]1; Brightness = [byte]$value } -ErrorAction Stop | Out-Null
+                $ok = $true
+            }
+        } else {
+            $code = if ($feature -eq 'volume') { [MonitorUtil]::VCP_VOLUME } else { [MonitorUtil]::VCP_BRIGHTNESS }
+            $ok = [MonitorUtil]::SetFeature($display.HMonitor, $display.Index, $code, $value)
+        }
+    } catch {}
+    if ($ok) {
+        Write-Log "display '$($display.Name)' $feature set to $value"
+    } else {
+        Write-Log "display '$($display.Name)' $feature change FAILED (monitor disconnected or DDC/CI disabled?) - re-detecting displays"
+        $script:Displays = $null
+    }
+    return $ok
+}
+
+function Request-DisplayWrite($display, [string]$feature) {
+    $key = "$($display.Kind)|$($display.HMonitor)|$($display.Index)|$($display.InstanceName)|$feature"
+    $script:PendingDisplayWrites[$key] = @{ Display = $display; Feature = $feature }
+    $displayWriteTimer.Stop()
+    $displayWriteTimer.Start()
+}
+
+function Set-AllDisplaysBrightness([int]$percent) {
+    Update-DisplayList
+    foreach ($d in @($script:Displays | Where-Object { $_.HasBrightness })) {
+        $d.Brightness = [int][Math]::Round($percent * $d.BrightnessMax / 100.0)
+        [void](Write-DisplayFeature $d 'brightness')
+    }
+    if ($settingsForm.Visible) { Update-DisplaysPanel }
 }
 
 function Get-PixelsPerMm {
@@ -414,6 +655,15 @@ foreach ($label in $snoozePresets.Keys) {
 $intervalMenu = New-Object System.Windows.Forms.ToolStripMenuItem("Interval")
 [void]$menu.Items.Add($intervalMenu)
 
+$brightnessMenu = New-Object System.Windows.Forms.ToolStripMenuItem("Brightness (all displays)")
+[void]$menu.Items.Add($brightnessMenu)
+foreach ($pct in @(25, 50, 75, 100)) {
+    $brightnessItem = New-Object System.Windows.Forms.ToolStripMenuItem("$pct%")
+    $brightnessItem.Tag = $pct
+    $brightnessItem.Add_Click({ Set-AllDisplaysBrightness $this.Tag })
+    [void]$brightnessMenu.DropDownItems.Add($brightnessItem)
+}
+
 [void]$menu.Items.Add("-")
 $uninstallItem = $menu.Items.Add("Uninstall")
 $quitItem = $menu.Items.Add("Quit")
@@ -448,7 +698,7 @@ $settingsForm = New-Object LidAwareForm
 $settingsForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $settingsForm.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
 $settingsForm.Text = "Status Keeper v$AppVersion"
-$settingsForm.Size = New-Object System.Drawing.Size(400, 660)
+$settingsForm.Size = New-Object System.Drawing.Size(400, 790)
 $settingsForm.FormBorderStyle = 'FixedDialog'
 $settingsForm.MaximizeBox = $false
 $settingsForm.MinimizeBox = $false
@@ -598,30 +848,74 @@ $divider2.Size = New-Object System.Drawing.Size(320, 1)
 $divider2.BackColor = $dividerColor
 $settingsForm.Controls.Add($divider2)
 
+$displaysLabel = New-Object System.Windows.Forms.Label
+$displaysLabel.Text = "Displays:"
+$displaysLabel.Location = New-Object System.Drawing.Point(20, 298)
+$displaysLabel.Size = New-Object System.Drawing.Size(150, 20)
+$displaysLabel.ForeColor = $textColor
+$settingsForm.Controls.Add($displaysLabel)
+
+$refreshDisplaysBtn = New-Object System.Windows.Forms.Button
+$refreshDisplaysBtn.Text = "Re-detect"
+$refreshDisplaysBtn.Location = New-Object System.Drawing.Point(260, 294)
+$refreshDisplaysBtn.Size = New-Object System.Drawing.Size(100, 26)
+$settingsForm.Controls.Add($refreshDisplaysBtn)
+Style-SecondaryButton $refreshDisplaysBtn
+
+# Rows are built at runtime (one per detected display), so they live in their
+# own scrollable panel with a fixed footprint in the window.
+$displaysPanel = New-Object System.Windows.Forms.Panel
+$displaysPanel.Location = New-Object System.Drawing.Point(20, 324)
+$displaysPanel.Size = New-Object System.Drawing.Size(340, 124)
+$displaysPanel.AutoScroll = $true
+$displaysPanel.BackColor = $bgColor
+$settingsForm.Controls.Add($displaysPanel)
+
+$script:LinkBrightnessEnabled = Get-SavedLinkBrightnessEnabled
+$linkBrightnessCheckbox = New-Object System.Windows.Forms.CheckBox
+$linkBrightnessCheckbox.Text = "Brightness keys also adjust monitors"
+$linkBrightnessCheckbox.Location = New-Object System.Drawing.Point(20, 452)
+$linkBrightnessCheckbox.Size = New-Object System.Drawing.Size(340, 24)
+$linkBrightnessCheckbox.ForeColor = $textColor
+$linkBrightnessCheckbox.Checked = $script:LinkBrightnessEnabled
+$settingsForm.Controls.Add($linkBrightnessCheckbox)
+
+$linkBrightnessCheckbox.Add_CheckedChanged({
+    $script:LinkBrightnessEnabled = $linkBrightnessCheckbox.Checked
+    Save-LinkBrightnessEnabled $script:LinkBrightnessEnabled
+    Write-Log "link external monitors to laptop brightness keys set to $($script:LinkBrightnessEnabled)"
+})
+
+$divider4 = New-Object System.Windows.Forms.Panel
+$divider4.Location = New-Object System.Drawing.Point(20, 484)
+$divider4.Size = New-Object System.Drawing.Size(320, 1)
+$divider4.BackColor = $dividerColor
+$settingsForm.Controls.Add($divider4)
+
 $logLabel = New-Object System.Windows.Forms.Label
 $logLabel.Text = "Activity log:"
-$logLabel.Location = New-Object System.Drawing.Point(20, 298)
+$logLabel.Location = New-Object System.Drawing.Point(20, 498)
 $logLabel.Size = New-Object System.Drawing.Size(150, 20)
 $logLabel.ForeColor = $textColor
 $settingsForm.Controls.Add($logLabel)
 
 $refreshLogBtn = New-Object System.Windows.Forms.Button
 $refreshLogBtn.Text = "Refresh"
-$refreshLogBtn.Location = New-Object System.Drawing.Point(185, 294)
-$refreshLogBtn.Size = New-Object System.Drawing.Size(70, 26)
+$refreshLogBtn.Location = New-Object System.Drawing.Point(160, 494)
+$refreshLogBtn.Size = New-Object System.Drawing.Size(92, 26)
 $settingsForm.Controls.Add($refreshLogBtn)
 Style-SecondaryButton $refreshLogBtn
 
 $openLogBtn = New-Object System.Windows.Forms.Button
 $openLogBtn.Text = "Open Log File"
-$openLogBtn.Location = New-Object System.Drawing.Point(260, 294)
+$openLogBtn.Location = New-Object System.Drawing.Point(260, 494)
 $openLogBtn.Size = New-Object System.Drawing.Size(100, 26)
 $settingsForm.Controls.Add($openLogBtn)
 Style-SecondaryButton $openLogBtn
 
 $logTextBox = New-Object System.Windows.Forms.TextBox
-$logTextBox.Location = New-Object System.Drawing.Point(20, 324)
-$logTextBox.Size = New-Object System.Drawing.Size(340, 200)
+$logTextBox.Location = New-Object System.Drawing.Point(20, 524)
+$logTextBox.Size = New-Object System.Drawing.Size(340, 130)
 $logTextBox.Multiline = $true
 $logTextBox.ReadOnly = $true
 $logTextBox.ScrollBars = 'Vertical'
@@ -632,28 +926,28 @@ $logTextBox.Font = New-Object System.Drawing.Font("Consolas", 8.5)
 $settingsForm.Controls.Add($logTextBox)
 
 $divider3 = New-Object System.Windows.Forms.Panel
-$divider3.Location = New-Object System.Drawing.Point(20, 536)
+$divider3.Location = New-Object System.Drawing.Point(20, 666)
 $divider3.Size = New-Object System.Drawing.Size(320, 1)
 $divider3.BackColor = $dividerColor
 $settingsForm.Controls.Add($divider3)
 
 $closeBtn = New-Object System.Windows.Forms.Button
 $closeBtn.Text = "Close"
-$closeBtn.Location = New-Object System.Drawing.Point(20, 550)
+$closeBtn.Location = New-Object System.Drawing.Point(20, 680)
 $closeBtn.Size = New-Object System.Drawing.Size(150, 36)
 $settingsForm.Controls.Add($closeBtn)
 Style-SecondaryButton $closeBtn
 
 $quitBtn = New-Object System.Windows.Forms.Button
 $quitBtn.Text = "Quit Status Keeper"
-$quitBtn.Location = New-Object System.Drawing.Point(190, 550)
+$quitBtn.Location = New-Object System.Drawing.Point(190, 680)
 $quitBtn.Size = New-Object System.Drawing.Size(150, 36)
 $settingsForm.Controls.Add($quitBtn)
 Style-SecondaryButton $quitBtn
 
 $versionLabel = New-Object System.Windows.Forms.Label
 $versionLabel.Text = "Status Keeper v$AppVersion"
-$versionLabel.Location = New-Object System.Drawing.Point(20, 596)
+$versionLabel.Location = New-Object System.Drawing.Point(20, 726)
 $versionLabel.Size = New-Object System.Drawing.Size(340, 18)
 $versionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 $versionLabel.ForeColor = $dividerColor
@@ -675,12 +969,184 @@ $logRefreshTimer = New-Object System.Windows.Forms.Timer
 $logRefreshTimer.Interval = 2000
 $logRefreshTimer.Add_Tick({ Update-LogView })
 
+$displayWriteTimer = New-Object System.Windows.Forms.Timer
+$displayWriteTimer.Interval = 150
+$displayWriteTimer.Add_Tick({
+    $displayWriteTimer.Stop()
+    $pending = @($script:PendingDisplayWrites.Values)
+    $script:PendingDisplayWrites.Clear()
+    foreach ($p in $pending) { [void](Write-DisplayFeature $p.Display $p.Feature) }
+})
+
+$script:SuppressDisplayEvents = $false
+
+function Add-DisplaySliderRow($display, [string]$feature, [int]$y, [double]$k) {
+    $max = if ($feature -eq 'volume') { $display.VolumeMax } else { $display.BrightnessMax }
+    $cur = if ($feature -eq 'volume') { $display.Volume } else { $display.Brightness }
+
+    $nameLbl = New-Object System.Windows.Forms.Label
+    $nameLbl.Text = if ($feature -eq 'volume') { "Volume" } else { "Brightness" }
+    $nameLbl.Location = New-Object System.Drawing.Point(0, [int](($y + 3) * $k))
+    $nameLbl.Size = New-Object System.Drawing.Size([int](92 * $k), [int](20 * $k))
+    $nameLbl.ForeColor = $textColor
+    $displaysPanel.Controls.Add($nameLbl)
+
+    $valueLbl = New-Object System.Windows.Forms.Label
+    $valueLbl.Location = New-Object System.Drawing.Point([int](258 * $k), [int](($y + 3) * $k))
+    $valueLbl.Size = New-Object System.Drawing.Size([int](56 * $k), [int](20 * $k))
+    $valueLbl.ForeColor = $textColor
+    $displaysPanel.Controls.Add($valueLbl)
+
+    $bar = New-Object System.Windows.Forms.TrackBar
+    $bar.AutoSize = $false
+    $bar.TickStyle = 'None'
+    $bar.Minimum = 0
+    $bar.Maximum = $max
+    $bar.SmallChange = 1
+    $bar.LargeChange = [Math]::Max(1, [int]($max / 10))
+    $bar.Value = [Math]::Min($max, [Math]::Max(0, $cur))
+    $bar.Location = New-Object System.Drawing.Point([int](92 * $k), [int]($y * $k))
+    $bar.Size = New-Object System.Drawing.Size([int](164 * $k), [int](26 * $k))
+    $bar.BackColor = $bgColor
+    $bar.Tag = @{ Display = $display; Feature = $feature; ValueLabel = $valueLbl }
+    $valueLbl.Text = "$([Math]::Round(100.0 * $bar.Value / $max))%"
+    $bar.Add_ValueChanged({
+        $t = $this.Tag
+        $t.ValueLabel.Text = "$([Math]::Round(100.0 * $this.Value / $this.Maximum))%"
+        if ($script:SuppressDisplayEvents) { return }
+        if ($t.Feature -eq 'volume') { $t.Display.Volume = $this.Value } else { $t.Display.Brightness = $this.Value }
+        Request-DisplayWrite $t.Display $t.Feature
+    })
+    $displaysPanel.Controls.Add($bar)
+
+    if ($feature -eq 'volume') { $display.VolumeBar = $bar } else { $display.BrightnessBar = $bar }
+}
+
+function Update-DisplaysPanel {
+    $script:SuppressDisplayEvents = $true
+    $displaysPanel.SuspendLayout()
+    try {
+        $displaysPanel.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
+        while ($displaysPanel.Controls.Count -gt 0) { $displaysPanel.Controls[0].Dispose() }
+        if ($null -eq $script:Displays) { Update-DisplayList }
+        # Rows are created after the form's DPI auto-scaling already ran, so scale
+        # them by hand using the panel's actual vs. designed width.
+        $k = $displaysPanel.Width / 340.0
+        $y = 0
+        if ($script:Displays.Count -eq 0) {
+            $noneLbl = New-Object System.Windows.Forms.Label
+            $noneLbl.Text = "No adjustable displays found. External monitors must have DDC/CI enabled in their own on-screen menu."
+            $noneLbl.Location = New-Object System.Drawing.Point(0, 0)
+            $noneLbl.Size = New-Object System.Drawing.Size([int](320 * $k), [int](50 * $k))
+            $noneLbl.ForeColor = $pausedColor
+            $displaysPanel.Controls.Add($noneLbl)
+        }
+        foreach ($d in $script:Displays) {
+            $titleLbl = New-Object System.Windows.Forms.Label
+            $titleLbl.Text = $d.Name
+            $titleLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+            $titleLbl.Location = New-Object System.Drawing.Point(0, [int]($y * $k))
+            $titleLbl.Size = New-Object System.Drawing.Size([int](315 * $k), [int](20 * $k))
+            $titleLbl.ForeColor = $textColor
+            $displaysPanel.Controls.Add($titleLbl)
+            $y += 20
+            if ($d.HasBrightness) { Add-DisplaySliderRow $d 'brightness' $y $k; $y += 26 }
+            if ($d.HasVolume) { Add-DisplaySliderRow $d 'volume' $y $k; $y += 26 }
+            $y += 4
+        }
+    } finally {
+        $displaysPanel.ResumeLayout()
+        $script:SuppressDisplayEvents = $false
+    }
+}
+
+function Sync-DisplaySliders {
+    $script:SuppressDisplayEvents = $true
+    try {
+        foreach ($d in @($script:Displays)) {
+            if ($d.BrightnessBar -and -not $d.BrightnessBar.IsDisposed) {
+                $d.BrightnessBar.Value = [Math]::Min($d.BrightnessBar.Maximum, [Math]::Max(0, $d.Brightness))
+            }
+            if ($d.VolumeBar -and -not $d.VolumeBar.IsDisposed) {
+                $d.VolumeBar.Value = [Math]::Min($d.VolumeBar.Maximum, [Math]::Max(0, $d.Volume))
+            }
+        }
+    } finally {
+        $script:SuppressDisplayEvents = $false
+    }
+}
+
+function Refresh-Displays {
+    $settingsForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        Update-DisplayList
+        Update-DisplaysPanel
+    } finally {
+        $settingsForm.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+}
+
+# The laptop's Fn brightness keys are handled by firmware and only surface as a
+# change of the built-in panel's brightness. Mirror each change as a relative
+# step onto external monitors, so each keeps its own offset from the laptop screen.
+function Get-InternalBrightness {
+    try {
+        $b = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object { $_.Active } | Select-Object -First 1
+        if ($b) { return [int]$b.CurrentBrightness }
+    } catch {}
+    return -1
+}
+
+$settingsForm.add_BrightnessChanged({
+    # The notification is only used as a trigger: its value can be stale (the one
+    # sent right after registering was observed still reporting a level from
+    # minutes earlier), so read the panel's real current brightness instead.
+    $new = Get-InternalBrightness
+    if ($new -lt 0) { $new = $settingsForm.CurrentBrightness }
+    $old = $script:LastInternalBrightness
+    $script:LastInternalBrightness = $new
+    if ($old -lt 0 -or $new -eq $old) { return }
+
+    foreach ($b in @($script:Displays | Where-Object { $_.Kind -eq 'wmi' })) { $b.Brightness = $new }
+
+    if ($script:LinkBrightnessEnabled) {
+        # Within a burst of key presses the cache is authoritative (writes may still
+        # be queued); after a pause, re-read what the monitor actually has.
+        if ($null -eq $script:Displays) {
+            Update-DisplayList
+            $rebuilt = $true
+        } elseif (-not $displayWriteTimer.Enabled -and ((Get-Date) - $script:DisplaysReadAt).TotalSeconds -gt 3) {
+            Update-DisplayValues
+            $rebuilt = ($null -eq ($script:Displays | Where-Object { $_.BrightnessBar } | Select-Object -First 1))
+        } else {
+            $rebuilt = $false
+        }
+        $delta = $new - $old
+        $externals = @($script:Displays | Where-Object { $_.Kind -eq 'ddc' -and $_.HasBrightness })
+        foreach ($e in $externals) {
+            $target = [int][Math]::Round($e.Brightness + ($delta * $e.BrightnessMax / 100.0))
+            $e.Brightness = [Math]::Min($e.BrightnessMax, [Math]::Max(0, $target))
+            Request-DisplayWrite $e 'brightness'
+        }
+        if ($externals.Count -gt 0) {
+            Write-Log "laptop brightness $old% -> $new%, adjusting external monitors by $(if ($delta -gt 0) { '+' })$delta%"
+        }
+        $script:DisplaysReadAt = Get-Date
+        if ($settingsForm.Visible -and $rebuilt) { Update-DisplaysPanel; return }
+    }
+    if ($settingsForm.Visible) { Sync-DisplaySliders }
+})
+# Baseline from the real current level, so the initial notification Windows sends
+# after registering is a no-op instead of being mistaken for a key press.
+$script:LastInternalBrightness = Get-InternalBrightness
+
 function Hide-SettingsWindow {
     $logRefreshTimer.Stop()
     $settingsForm.Hide()
 }
 
 $refreshLogBtn.Add_Click({ Update-LogView })
+$refreshDisplaysBtn.Add_Click({ Refresh-Displays })
 $openLogBtn.Add_Click({
     try { Start-Process notepad.exe -ArgumentList "`"$LogPath`"" } catch {}
 })
@@ -767,10 +1233,13 @@ function Show-SettingsWindow {
     $distanceNumeric.Value = [Math]::Min($MaxDistanceMm, [Math]::Max($MinDistanceMm, [int]$script:CurrentDistanceMm))
     Update-DistanceReadout
     $lidLockCheckbox.Checked = $script:LidLockEnabled
+    $linkBrightnessCheckbox.Checked = $script:LinkBrightnessEnabled
     Update-LogView
     $logRefreshTimer.Start()
     $settingsForm.Show()
     $settingsForm.Activate()
+    # After Show(), so the panel already has its final DPI-scaled size
+    Refresh-Displays
 }
 
 function Invoke-Quit {
