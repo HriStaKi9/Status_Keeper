@@ -10,6 +10,8 @@ A small Windows tray app that keeps your online status (Teams, Slack, etc.) acti
 - **Configurable nudge distance** — a real physical distance, 1mm to 5cm, not an arbitrary pixel count. It reads your monitor's true physical size (not just its resolution or Windows' DPI-scaling setting) to convert accurately, and shows a live cm/pixel readout as you adjust it.
 - **Snooze** — pause for 30 min / 1 hour / 2 hours from the tray menu, with automatic resume. The settings window shows the exact resume time while snoozed, so you don't forget you paused it.
 - **Lock on lid close** — optionally locks the computer the moment the laptop lid closes, detected directly from the hardware lid-switch signal rather than relying on (and potentially fighting) Windows' own power-plan settings, which may be locked down by IT policy anyway.
+- **Display brightness & volume** — the settings window lists every display it can control, with live sliders: the laptop's built-in screen (brightness, via Windows) and external monitors (brightness and, where the monitor supports it, speaker volume, via DDC/CI — the monitor's own control channel over the video cable). Sliders read the monitor's real current values each time the window opens. The tray menu also has quick brightness presets (25/50/75/100%) for all displays at once.
+- **Laptop brightness keys control external monitors too** — optional. The laptop's Fn brightness keys are handled by firmware and only ever change the built-in screen; with this enabled, every change is mirrored as the same relative step (e.g. +5%) onto external monitors, so each keeps its own offset from the laptop screen.
 - **Light/dark theme detection** — automatically matches Windows' current app theme, including the window's title bar.
 - **Activity log** — a live, scrollable log of every nudge, skip, pause, and theme/lid event, viewable right inside the settings window (auto-refreshing) or as a plain text file.
 - **Self-installing** — running the `.exe` from anywhere (Downloads, a USB stick, wherever) asks for one-time consent, then copies itself to `%LOCALAPPDATA%\StatusKeeper`, registers to start at login, and adds a proper entry to Windows Settings → Apps, with a working Uninstall button.
@@ -25,8 +27,16 @@ That's it — it's now running in the tray and will start automatically every ti
 
 ## Usage
 
-- **Left-click the tray icon** to open the settings window: pause/resume, adjust interval and nudge distance, toggle lock-on-lid-close, and view the activity log.
-- **Right-click the tray icon** for quick actions: Pause/Resume, Snooze presets, Interval presets, Uninstall, Quit.
+- **Left-click the tray icon** to open the settings window: pause/resume, adjust interval and nudge distance, toggle lock-on-lid-close, adjust display brightness/volume, and view the activity log.
+- **Right-click the tray icon** for quick actions: Pause/Resume, Snooze presets, Interval presets, Brightness presets, Uninstall, Quit.
+
+### Display control notes
+
+- External monitors need **DDC/CI** enabled in their own on-screen menu (it usually is by default). Monitors that don't answer simply don't get sliders.
+- The monitor volume slider is the monitor's own speaker/headphone-jack volume, separate from the Windows volume. Your laptop's volume keys keep controlling the Windows volume as usual.
+- Brightness-key linking only works while the laptop screen is on: with the lid closed (external monitor only), Windows has no built-in brightness for the keys to change.
+- Anything else that changes the laptop screen's brightness (e.g. battery saver dimming) is mirrored too while linking is on.
+- After docking/undocking, click **Re-detect** (or reopen the window).
 
 ## Uninstalling
 
@@ -45,6 +55,7 @@ All state lives in `%LOCALAPPDATA%\StatusKeeper\`:
 | `interval.txt` | Nudge interval, in seconds |
 | `distance.txt` | Nudge distance, in millimeters |
 | `lidlock.txt` | `1` or `0` — lock-on-lid-close enabled |
+| `linkbrightness.txt` | `1` or `0` — laptop brightness keys also adjust external monitors |
 | `status-keeper.log` | Full activity log |
 
 These are managed through the settings window — you shouldn't normally need to edit them by hand.
@@ -58,7 +69,7 @@ Install-Module ps2exe -Scope CurrentUser
 
 Invoke-ps2exe -inputFile "StatusKeeper.ps1" -outputFile "StatusKeeper.exe" `
     -iconFile "icon.ico" -noConsole -STA `
-    -title "Status Keeper" -product "Status Keeper" -version "1.1.0.0" `
+    -title "Status Keeper" -product "Status Keeper" -version "1.2.0.0" `
     -description "Keeps your online status active" -company "Status Keeper"
 ```
 
